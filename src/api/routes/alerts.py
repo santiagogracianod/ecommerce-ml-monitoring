@@ -5,6 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.dependencies import get_db, get_alert_service
 from src.services.alert_service import AlertService
+from src.services.threshold_config_service import get_threshold_config_service
+from src.models.schemas import UpdateAlertThresholdRequest, AlertThresholdResponse
 from src.core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -172,4 +174,114 @@ async def get_alert(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get alert: {str(e)}"
+        )
+
+
+# ============================================================================
+# ALERT THRESHOLD CONFIGURATION ENDPOINTS
+# ============================================================================
+
+@router.get("/config/thresholds", response_model=AlertThresholdResponse)
+async def get_alert_thresholds(
+    service_name: str = None,
+    db: AsyncSession = Depends(get_db),
+) -> AlertThresholdResponse:
+    """
+    Get current alert thresholds.
+
+    Args:
+        service_name: Optional service name to get service-specific overrides
+        db: Database session
+
+    Returns:
+        Current alert threshold configuration
+    """
+    try:
+        config_service = get_threshold_config_service()
+        return await config_service.get_thresholds(db, service_name)
+
+    except Exception as e:
+        logger.error("failed_to_get_thresholds", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get alert thresholds: {str(e)}"
+        )
+
+
+@router.put("/config/thresholds", response_model=AlertThresholdResponse)
+async def update_alert_thresholds(
+    request: UpdateAlertThresholdRequest,
+    db: AsyncSession = Depends(get_db),
+) -> AlertThresholdResponse:
+    """
+    Update alert thresholds dynamically without restarting the service.
+
+    This endpoint allows you to modify alert thresholds in real-time.
+    The changes take effect immediately (within ~60 seconds due to caching).
+
+    Args:
+        request: Update request with new threshold values
+        db: Database session
+
+    Returns:
+        Updated alert threshold configuration
+
+    Example:
+        ```json
+        {
+            "drift_threshold": 0.25,
+            "latency_threshold_ms": 1500,
+            "description": "Lowered drift threshold to be more sensitive",
+            "updated_by": "admin_user"
+        }
+        ```
+    """
+    try:
+        config_service = get_threshold_config_service()
+        updated_config = await config_service.update_thresholds(db, request)
+
+        logger.info(
+            "alert_thresholds_updated_via_api",
+            updated_by=request.updated_by,
+            drift_threshold=request.drift_threshold,
+            latency_threshold_ms=request.latency_threshold_ms
+        )
+
+        return updated_config
+
+    except Exception as e:
+        logger.error("failed_to_update_thresholds", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update alert thresholds: {str(e)}"
+        )
+
+
+@router.post("/config/thresholds/invalidate-cache")
+async def invalidate_threshold_cache() -> Dict[str, str]:
+    """
+    Manually invalidate the threshold configuration cache.
+
+    This forces the service to reload thresholds from the database immediately
+    instead of waiting for the cache TTL to expire.
+
+    Returns:
+        Success message
+    """
+    try:
+        config_service = get_threshold_config_service()
+        config_service.invalidate_cache()
+
+        logger.info("threshold_cache_invalidated_via_api")
+
+        return {
+            "status": "success",
+            "message": "Threshold cache invalidated. New values will be loaded on next access."
+        }
+
+    except Exception as e:
+        logger.error("failed_to_invalidate_cache", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to invalidate cache: {str(e)}"
         )

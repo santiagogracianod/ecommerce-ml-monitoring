@@ -6,15 +6,16 @@ from fastapi.responses import JSONResponse
 
 from src.core.config import get_settings
 from src.core.logging_config import setup_logging, get_logger
-from src.storage.database import init_db, close_db
+from src.storage.database import init_db, close_db, get_db
 from src.api.routes import predictions, monitoring, alerts
+from src.services.threshold_config_service import get_threshold_config_service
 
 settings = get_settings()
 logger = get_logger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI):  # noqa: ARG001
     """Application lifespan events."""
     # Startup
     logger.info("starting_ml_monitoring_service", version=settings.app_version)
@@ -27,6 +28,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("database_initialization_failed", error=str(e))
         raise
+
+    # Initialize default threshold configuration
+    try:
+        async for db in get_db():
+            threshold_service = get_threshold_config_service()
+            await threshold_service.initialize_default_config(db)
+            logger.info("threshold_config_initialized")
+            break  # Only need one iteration
+    except Exception as e:
+        logger.error("threshold_config_initialization_failed", error=str(e))
+        # Don't raise - service can still work with settings defaults
 
     yield
 

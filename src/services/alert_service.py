@@ -9,6 +9,8 @@ from src.models.database import AlertDB
 from src.models.schemas import Alert, DriftMetrics, PerformanceMetrics, DataQualityMetrics
 from src.core.config import get_settings
 from src.core.logging_config import get_logger
+from src.services.rabbitmq_publisher import get_rabbitmq_publisher
+from src.services.threshold_config_service import get_threshold_config_service
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -70,7 +72,11 @@ class AlertService:
         if not drift_metrics.drift_detected:
             return None
 
-        if drift_metrics.drift_score < settings.drift_threshold:
+        # Get dynamic threshold configuration
+        config_service = get_threshold_config_service()
+        threshold_config = await config_service.get_thresholds(db, service_name)
+
+        if drift_metrics.drift_score < threshold_config.drift_threshold:
             return None
 
         # Determine severity
@@ -81,7 +87,7 @@ class AlertService:
         message = (
             f"Data drift detected in {service_name} service. "
             f"Drift score: {drift_metrics.drift_score:.3f} "
-            f"(threshold: {drift_metrics.drift_threshold:.3f})"
+            f"(threshold: {threshold_config.drift_threshold:.3f})"
         )
 
         return await self.create_alert(
@@ -94,7 +100,7 @@ class AlertService:
             metrics={
                 "drift_score": drift_metrics.drift_score,
                 "drift_by_feature": drift_metrics.drift_by_feature,
-                "threshold": drift_metrics.drift_threshold,
+                "threshold": threshold_config.drift_threshold,
             }
         )
 
@@ -107,9 +113,13 @@ class AlertService:
         """Check performance metrics and create alerts if thresholds exceeded."""
         alerts = []
 
+        # Get dynamic threshold configuration
+        config_service = get_threshold_config_service()
+        threshold_config = await config_service.get_thresholds(db, service_name)
+
         # Check latency
-        if perf_metrics.p95_latency_ms > settings.latency_threshold_ms:
-            severity = "critical" if perf_metrics.p95_latency_ms > settings.latency_threshold_ms * 2 else "warning"
+        if perf_metrics.p95_latency_ms > threshold_config.latency_threshold_ms:
+            severity = "critical" if perf_metrics.p95_latency_ms > threshold_config.latency_threshold_ms * 2 else "warning"
 
             alert = await self.create_alert(
                 db=db,
@@ -119,7 +129,7 @@ class AlertService:
                 title=f"High Latency - {service_name.upper()}",
                 message=(
                     f"P95 latency is {perf_metrics.p95_latency_ms:.0f}ms "
-                    f"(threshold: {settings.latency_threshold_ms}ms)"
+                    f"(threshold: {threshold_config.latency_threshold_ms}ms)"
                 ),
                 metrics={
                     "p95_latency_ms": perf_metrics.p95_latency_ms,
@@ -130,8 +140,8 @@ class AlertService:
             alerts.append(alert)
 
         # Check error rate
-        if perf_metrics.error_rate > settings.error_rate_threshold:
-            severity = "critical" if perf_metrics.error_rate > settings.error_rate_threshold * 2 else "warning"
+        if perf_metrics.error_rate > threshold_config.error_rate_threshold:
+            severity = "critical" if perf_metrics.error_rate > threshold_config.error_rate_threshold * 2 else "warning"
 
             alert = await self.create_alert(
                 db=db,
@@ -141,7 +151,7 @@ class AlertService:
                 title=f"High Error Rate - {service_name.upper()}",
                 message=(
                     f"Error rate is {perf_metrics.error_rate:.2%} "
-                    f"(threshold: {settings.error_rate_threshold:.2%})"
+                    f"(threshold: {threshold_config.error_rate_threshold:.2%})"
                 ),
                 metrics={
                     "error_rate": perf_metrics.error_rate,
@@ -272,6 +282,10 @@ class AlertService:
         if settings.slack_enabled and settings.slack_webhook_url:
             await self._send_slack_notification(alert)
 
+        # Send to RabbitMQ if enabled
+        if settings.rabbitmq_enabled:
+            self._send_rabbitmq_notification(alert)
+
         # Add other notification channels here (email, PagerDuty, etc.)
 
     async def _send_slack_notification(self, alert: AlertDB) -> None:
@@ -333,3 +347,62 @@ class AlertService:
 
         except Exception as e:
             logger.error("error_sending_slack_notification", error=str(e))
+
+    def _send_rabbitmq_notification(self, alert: AlertDB) -> None:
+        """Send alert to RabbitMQ."""
+        try:
+            rabbitmq_publisher = get_rabbitmq_publisher()
+
+            # Route to appropriate publish method based on alert type
+            if alert.alert_type == "drift":
+                success = rabbitmq_publisher.publish_drift_alert(
+                    service_name=alert.service_name,
+                    drift_score=alert.metrics.get("drift_score", 0.0),
+                    drift_by_feature=alert.metrics.get("drift_by_feature", {}),
+                    severity=alert.severity,
+                    threshold=alert.metrics.get("threshold", 0.0),
+                    alert_id=str(alert.id),
+                )
+            elif alert.alert_type in ["performance", "error"]:
+                success = rabbitmq_publisher.publish_performance_alert(
+                    service_name=alert.service_name,
+                    alert_type=alert.alert_type,
+                    severity=alert.severity,
+                    metrics=alert.metrics,
+                    alert_id=str(alert.id),
+                )
+            elif alert.alert_type == "data_quality":
+                success = rabbitmq_publisher.publish_data_quality_alert(
+                    service_name=alert.service_name,
+                    severity=alert.severity,
+                    quality_score=alert.metrics.get("quality_score", 0.0),
+                    issues={
+                        "missing_values_percentage": alert.metrics.get("missing_values_percentage", 0.0),
+                        "duplicates_count": alert.metrics.get("duplicates_count", 0),
+                        "out_of_range_count": alert.metrics.get("out_of_range_count", 0),
+                    },
+                    alert_id=str(alert.id),
+                )
+            else:
+                logger.warning(
+                    "unknown_alert_type_for_rabbitmq",
+                    alert_type=alert.alert_type,
+                    alert_id=str(alert.id)
+                )
+                return
+
+            if success:
+                logger.info(
+                    "rabbitmq_notification_sent",
+                    alert_id=str(alert.id),
+                    alert_type=alert.alert_type
+                )
+            else:
+                logger.warning(
+                    "rabbitmq_notification_failed",
+                    alert_id=str(alert.id),
+                    alert_type=alert.alert_type
+                )
+
+        except Exception as e:
+            logger.error("error_sending_rabbitmq_notification", error=str(e))

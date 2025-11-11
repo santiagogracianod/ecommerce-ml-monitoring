@@ -73,6 +73,14 @@ class Settings(BaseSettings):
     slack_webhook_url: Optional[str] = None
     slack_channel: str = "#ml-alerts"
 
+    # RabbitMQ Configuration
+    rabbitmq_enabled: bool = True
+    rabbitmq_host: str = "localhost"
+    rabbitmq_port: int = 5672
+    rabbitmq_user: str = "guest"
+    rabbitmq_password: str = "guest"
+    rabbitmq_queue_name: str = "ml_monitoring_alerts"
+
     # Data Retention
     prediction_log_retention_days: int = 30
     report_retention_days: int = 90

@@ -14,13 +14,16 @@ from src.api.dependencies import (
 from src.services.prediction_logger import PredictionLoggerService
 from src.services.evidently_service import EvidentlyMonitoringService
 from src.services.alert_service import AlertService
+from src.services.drift_analysis_service import get_drift_analysis_service, DriftAnalysisService
+from src.services.rabbitmq_publisher import get_rabbitmq_publisher
 from src.models.schemas import (
     GenerateReportRequest,
     UpdateReferenceDataRequest,
     MonitoringReport,
     DriftMetrics,
     PerformanceMetrics,
-    DataQualityMetrics
+    DataQualityMetrics,
+    DriftDegradationAnalysis
 )
 from src.models.database import MonitoringReportDB
 from src.core.logging_config import get_logger
@@ -358,4 +361,149 @@ async def update_reference_data(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update reference data: {str(e)}"
+        )
+
+
+# ============================================================================
+# DRIFT DEGRADATION ANALYSIS
+# ============================================================================
+
+@router.get("/drift/analysis", response_model=DriftDegradationAnalysis)
+async def analyze_drift_degradation(
+    service_name: str,
+    hours: int = 168,  # Default: last 7 days
+    db: AsyncSession = Depends(get_db),
+) -> DriftDegradationAnalysis:
+    """
+    Analyze drift degradation over time for a service.
+
+    This endpoint provides comprehensive drift analysis including:
+    - **Trend analysis**: Is drift increasing, decreasing, or stable?
+    - **Degradation rate**: How fast is drift changing (per hour)?
+    - **Feature-level analysis**: Which features are drifting most?
+    - **Predictions**: When will drift breach the threshold?
+    - **Recommendations**: Actionable steps to take
+
+    Args:
+        service_name: Name of the service to analyze (search or sentiment)
+        hours: Number of hours to analyze (default: 168 = 7 days, max: 720 = 30 days)
+        db: Database session
+
+    Returns:
+        Comprehensive drift degradation analysis
+
+    Example:
+        ```bash
+        # Analyze last 7 days
+        curl "http://localhost:8003/api/v1/monitoring/drift/analysis?service_name=search"
+
+        # Analyze last 24 hours
+        curl "http://localhost:8003/api/v1/monitoring/drift/analysis?service_name=search&hours=24"
+        ```
+
+    Response includes:
+        - Current drift state and threshold
+        - Historical drift scores over time
+        - Trend (increasing/decreasing/stable)
+        - Degradation rate per hour
+        - Feature-level degradation analysis
+        - Prediction of when threshold will be breached
+        - Severity level and actionable recommendations
+    """
+    try:
+        # Validate service name
+        if service_name not in ["search", "sentiment"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid service_name: {service_name}. Must be 'search' or 'sentiment'."
+            )
+
+        # Validate hours range
+        if hours < 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="hours must be at least 1"
+            )
+        if hours > 720:  # 30 days
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="hours cannot exceed 720 (30 days)"
+            )
+
+        # Get drift analysis service
+        drift_service = get_drift_analysis_service()
+
+        # Perform analysis
+        analysis = await drift_service.analyze_drift_degradation(
+            db=db,
+            service_name=service_name,
+            hours=hours
+        )
+
+        logger.info(
+            "drift_analysis_completed",
+            service=service_name,
+            hours=hours,
+            trend=analysis.drift_trend,
+            severity=analysis.severity
+        )
+
+        # Publish to RabbitMQ if drift exceeds threshold
+        if analysis.current_drift_score > analysis.current_threshold:
+            try:
+                rabbitmq_publisher = get_rabbitmq_publisher()
+
+                # Build feature degradation dict for the message
+                drift_by_feature = {}
+                for feature_deg in analysis.features_degradation:
+                    drift_by_feature[feature_deg.feature_name] = feature_deg.current_drift_score
+
+                # Publish drift degradation alert
+                success = rabbitmq_publisher.publish_drift_alert(
+                    service_name=service_name,
+                    drift_score=analysis.current_drift_score,
+                    drift_by_feature=drift_by_feature,
+                    severity=analysis.severity,
+                    threshold=analysis.current_threshold,
+                    additional_metrics={
+                        "drift_trend": analysis.drift_trend,
+                        "degradation_rate_per_hour": analysis.degradation_rate_per_hour,
+                        "hours_until_breach": analysis.hours_until_breach,
+                        "projected_threshold_breach": analysis.projected_threshold_breach.isoformat() if analysis.projected_threshold_breach else None,
+                        "total_reports_analyzed": analysis.total_reports_analyzed,
+                        "most_degraded_features": analysis.most_degraded_features,
+                        "analysis_type": "degradation_analysis"
+                    }
+                )
+
+                if success:
+                    logger.info(
+                        "drift_analysis_alert_published_to_rabbitmq",
+                        service=service_name,
+                        drift_score=analysis.current_drift_score,
+                        threshold=analysis.current_threshold
+                    )
+                else:
+                    logger.warning(
+                        "failed_to_publish_drift_analysis_to_rabbitmq",
+                        service=service_name
+                    )
+
+            except Exception as e:
+                logger.error(
+                    "error_publishing_drift_analysis_to_rabbitmq",
+                    error=str(e),
+                    service=service_name
+                )
+                # Don't fail the analysis if RabbitMQ publish fails
+
+        return analysis
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("failed_to_analyze_drift", error=str(e), service=service_name)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to analyze drift degradation: {str(e)}"
         )
