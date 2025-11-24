@@ -34,6 +34,17 @@ class Settings(BaseSettings):
     comments_service_url: str = "http://localhost:8001"
     products_service_url: str = "http://localhost:8000"
 
+    # Search Services URLs (for health monitoring and failover)
+    semantic_search_url: str = "http://localhost:8004"
+    traditional_search_url: str = "http://localhost:8006"
+    semantic_search_name: str = "semantic-search"
+    traditional_search_name: str = "traditional-search"
+
+    # Health Check Configuration
+    health_check_interval: int = 30  # seconds
+    health_check_timeout: int = 5    # seconds
+    health_check_max_failures: int = 3  # consecutive failures before triggering alert
+
     # Monitoring Configuration
     enable_drift_monitoring: bool = True
     enable_performance_monitoring: bool = True

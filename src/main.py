@@ -7,8 +7,9 @@ from fastapi.responses import JSONResponse
 from src.core.config import get_settings
 from src.core.logging_config import setup_logging, get_logger
 from src.storage.database import init_db, close_db, get_db
-from src.api.routes import predictions, monitoring, alerts
+from src.api.routes import predictions, monitoring, alerts, search_health
 from src.services.threshold_config_service import get_threshold_config_service
+from src.services.search_health_monitor import get_search_health_monitor
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -40,10 +41,27 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         logger.error("threshold_config_initialization_failed", error=str(e))
         # Don't raise - service can still work with settings defaults
 
+    # Start search health monitoring
+    try:
+        search_monitor = get_search_health_monitor()
+        search_monitor.start_monitoring()
+        logger.info("search_health_monitoring_started")
+    except Exception as e:
+        logger.error("search_health_monitoring_start_failed", error=str(e))
+        # Don't raise - service can still work without health monitoring
+
     yield
 
     # Shutdown
     logger.info("shutting_down_ml_monitoring_service")
+
+    # Stop search health monitoring
+    try:
+        search_monitor = get_search_health_monitor()
+        await search_monitor.stop_monitoring()
+        logger.info("search_health_monitoring_stopped")
+    except Exception as e:
+        logger.error("search_health_monitoring_stop_failed", error=str(e))
     try:
         await close_db()
         logger.info("database_connections_closed")
@@ -79,6 +97,7 @@ app.add_middleware(
 app.include_router(predictions.router, prefix=settings.api_v1_prefix)
 app.include_router(monitoring.router, prefix=settings.api_v1_prefix)
 app.include_router(alerts.router, prefix=settings.api_v1_prefix)
+app.include_router(search_health.router, prefix=settings.api_v1_prefix)
 
 
 @app.get("/")
