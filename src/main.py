@@ -11,6 +11,8 @@ from src.api.routes import predictions, monitoring, alerts, search_health
 from src.services.threshold_config_service import get_threshold_config_service
 from src.services.search_health_monitor import get_search_health_monitor
 
+from .monitoring.prometheus_middleware import PrometheusMiddleware, metrics_response
+
 settings = get_settings()
 logger = get_logger(__name__)
 
@@ -93,6 +95,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Prometheus metrics middleware
+app.add_middleware(PrometheusMiddleware, service_name="ml-monitoring-service")
+
 # Include routers
 app.include_router(predictions.router, prefix=settings.api_v1_prefix)
 app.include_router(monitoring.router, prefix=settings.api_v1_prefix)
@@ -124,6 +129,12 @@ async def health_check():
             "environment": settings.app_env,
         }
     )
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    """Prometheus metrics endpoint."""
+    return metrics_response()
 
 
 @app.get(f"{settings.api_v1_prefix}/info")
