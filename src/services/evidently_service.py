@@ -14,6 +14,8 @@ from evidently.metrics import (
     DatasetMissingValuesMetric,
     ColumnDriftMetric,
     ColumnSummaryMetric,
+    ColumnDistributionMetric,
+    ColumnValueRangeMetric,
 )
 from evidently.test_suite import TestSuite
 from evidently.tests import (
@@ -88,7 +90,8 @@ class EvidentlyMonitoringService:
 
         # Generate and save HTML report
         report_path = await self._generate_html_report(
-            reference_df, current_df, column_mapping, "search"
+            reference_df, current_df, column_mapping, "search",
+            self._get_search_column_metrics()
         )
 
         return drift_metrics, quality_metrics, performance_metrics, report_path
@@ -158,7 +161,8 @@ class EvidentlyMonitoringService:
 
         # Generate and save HTML report
         report_path = await self._generate_html_report(
-            reference_df, current_df, column_mapping, "sentiment"
+            reference_df, current_df, column_mapping, "sentiment",
+            self._get_sentiment_column_metrics()
         )
 
         return drift_metrics, quality_metrics, performance_metrics, report_path
@@ -309,20 +313,53 @@ class EvidentlyMonitoringService:
                 error_rate=0.0,
             )
 
+    def _get_sentiment_column_metrics(self) -> list:
+        """Column-level metrics for the sentiment service."""
+        return [
+            # Resumen estadístico de las columnas clave
+            ColumnSummaryMetric(column_name="primary_score"),
+            ColumnSummaryMetric(column_name="text_length"),
+            ColumnSummaryMetric(column_name="latency_ms"),
+            # Distribución de etiquetas predichas y nivel de confianza
+            ColumnDistributionMetric(column_name="predicted_sentiment"),
+            ColumnDistributionMetric(column_name="primary_score"),
+            # Tasa de baja confianza: predicciones con primary_score < 0.7
+            ColumnValueRangeMetric(column_name="primary_score", left=0.7, right=1.0),
+        ]
+
+    def _get_search_column_metrics(self) -> list:
+        """Column-level metrics for the search service."""
+        return [
+            # Resumen estadístico de las columnas clave
+            ColumnSummaryMetric(column_name="avg_score"),
+            ColumnSummaryMetric(column_name="top_score"),
+            ColumnSummaryMetric(column_name="latency_ms"),
+            # Distribución de puntajes de relevancia
+            ColumnDistributionMetric(column_name="avg_score"),
+            ColumnDistributionMetric(column_name="top_score"),
+            # Tasa de baja relevancia: búsquedas con avg_score < 0.5
+            ColumnValueRangeMetric(column_name="avg_score", left=0.5, right=1.0),
+            # Tasa de cero resultados: num_results fuera del rango esperado
+            ColumnValueRangeMetric(column_name="num_results", left=1, right=10000),
+        ]
+
     async def _generate_html_report(
         self,
         reference_df: pd.DataFrame,
         current_df: pd.DataFrame,
         column_mapping: ColumnMapping,
         service_name: str,
+        column_metrics: Optional[list] = None,
     ) -> str:
         """Generate and save HTML report using Evidently."""
         try:
             # Create comprehensive report
-            report = Report(metrics=[
+            base_metrics = [
                 DataDriftPreset(),
                 DataQualityPreset(),
-            ])
+            ]
+            extra_metrics = column_metrics or []
+            report = Report(metrics=base_metrics + extra_metrics)
 
             report.run(
                 reference_data=reference_df,
@@ -405,33 +442,50 @@ class EvidentlyMonitoringService:
 
             df.to_parquet(file_path, index=False)
 
-            # Calculate statistics
+            # Calculate statistics (only numeric columns to avoid Timestamp serialization issues)
+            numeric_df = df.select_dtypes(include=[np.number])
+            numerical_stats = {
+                col: {k: round(float(v), 6) for k, v in stats.items()}
+                for col, stats in numeric_df.describe().to_dict().items()
+            }
             statistics = {
                 'num_samples': len(df),
                 'num_features': len(df.columns),
                 'columns': list(df.columns),
                 'dtypes': {col: str(dtype) for col, dtype in df.dtypes.items()},
-                'numerical_stats': df.describe().to_dict(),
+                'numerical_stats': numerical_stats,
             }
 
-            # Save metadata to database
-            from sqlalchemy import update
-            # Deactivate old reference data
-            update_query = update(ReferenceDataDB).where(
-                ReferenceDataDB.service_name == service_name
-            ).values(is_active=False)
-            await db.execute(update_query)
-
-            # Create new reference data entry
-            ref_data = ReferenceDataDB(
-                service_name=service_name,
-                num_samples=len(df),
-                features=list(df.columns),
-                statistics=statistics,
-                file_path=str(file_path),
-                is_active=True,
+            # Save metadata to database: update if exists, insert if not
+            from sqlalchemy import select, update
+            existing = await db.execute(
+                select(ReferenceDataDB).where(
+                    ReferenceDataDB.service_name == service_name
+                )
             )
-            db.add(ref_data)
+            existing_record = existing.scalar_one_or_none()
+
+            if existing_record:
+                await db.execute(
+                    update(ReferenceDataDB)
+                    .where(ReferenceDataDB.service_name == service_name)
+                    .values(
+                        num_samples=len(df),
+                        features=list(df.columns),
+                        statistics=statistics,
+                        file_path=str(file_path),
+                        is_active=True,
+                    )
+                )
+            else:
+                db.add(ReferenceDataDB(
+                    service_name=service_name,
+                    num_samples=len(df),
+                    features=list(df.columns),
+                    statistics=statistics,
+                    file_path=str(file_path),
+                    is_active=True,
+                ))
             await db.commit()
 
             logger.info(
