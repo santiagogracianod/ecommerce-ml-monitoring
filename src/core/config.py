@@ -84,6 +84,8 @@ class Settings(BaseSettings):
     slack_webhook_url: Optional[str] = None
     slack_channel: str = "#ml-alerts"
 
+# TODO: Pensar en variables de entorno para credencias sencibles
+
     # RabbitMQ Configuration
     rabbitmq_enabled: bool = True
     rabbitmq_host: str = "localhost"

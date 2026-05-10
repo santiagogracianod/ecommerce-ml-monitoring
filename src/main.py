@@ -1,4 +1,5 @@
 """Main FastAPI application for ML Monitoring Service."""
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,7 @@ from src.storage.database import init_db, close_db, get_db
 from src.api.routes import predictions, monitoring, alerts, search_health
 from src.services.threshold_config_service import get_threshold_config_service
 from src.services.search_health_monitor import get_search_health_monitor
+from src.services.rabbitmq_consumer import get_prediction_consumer
 
 from .monitoring.prometheus_middleware import PrometheusMiddleware, metrics_response
 
@@ -52,10 +54,27 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
         logger.error("search_health_monitoring_start_failed", error=str(e))
         # Don't raise - service can still work without health monitoring
 
+    # Start RabbitMQ prediction consumer
+    try:
+        loop = asyncio.get_event_loop()
+        prediction_consumer = get_prediction_consumer(loop)
+        prediction_consumer.start()
+        logger.info("rabbitmq_prediction_consumer_started")
+    except Exception as e:
+        logger.error("rabbitmq_prediction_consumer_start_failed", error=str(e))
+        # Don't raise - service can still work without the consumer
+
     yield
 
     # Shutdown
     logger.info("shutting_down_ml_monitoring_service")
+
+    # Stop RabbitMQ prediction consumer
+    try:
+        prediction_consumer.stop()
+        logger.info("rabbitmq_prediction_consumer_stopped")
+    except Exception as e:
+        logger.error("rabbitmq_prediction_consumer_stop_failed", error=str(e))
 
     # Stop search health monitoring
     try:
